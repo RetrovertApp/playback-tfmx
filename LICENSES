@@ -1,0 +1,24 @@
+This plugin's integration code (tfmx_plugin.c and CMakeLists.txt) is
+licensed under the MIT License. See the top-level LICENSE file.
+
+Third-party dependencies:
+=========================
+
+libtfmxaudiodecoder
+License: GPL-2.0-or-later
+Source: Vendored in src/ subdirectory
+
+The TFMX audio decoder library source code is vendored directly in the
+src/ subdirectory and is licensed under the GNU General Public License
+version 2 or later.
+
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 2, June 1991
+
+ Copyright (C) 1989, 1991 Free Software Foundation, Inc.,
+ <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+The full text of the GPL-2.0 can be found at:
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
