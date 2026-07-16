@@ -297,145 +297,171 @@ static void tfmx_static_init(const RVService* service_api) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Channel-based visualization callbacks
+// Visualization API (per-channel, non-synchronized)
 
-static int tfmx_get_tracker_info(void* user_data, RVTrackerInfo* info) {
-    TfmxReplayerData* data = (TfmxReplayerData*)user_data;
+#define TFMX_COLUMN_COUNT 5
+#define TFMX_CMD_WAIT 0xF3
 
-    if (data == nullptr || data->decoder == nullptr || info == nullptr) {
-        return -1;
+static void tfmx_set_cell(RVPatternCell* cell, uint32_t raw, const char* text) {
+    cell->raw = raw;
+    memset(cell->text, 0, sizeof(cell->text));
+    if (text != nullptr) {
+        strncpy((char*)cell->text, text, sizeof(cell->text) - 1);
     }
-
-    memset(info, 0, sizeof(RVTrackerInfo));
-
-    int num_tracks = tfmxdec_get_pattern_display_num_tracks(data->decoder);
-    if (num_tracks <= 0) {
-        return -1;
-    }
-
-    info->num_channels = (uint8_t)num_tracks;
-    info->channels_synchronized = 0; // TFMX tracks are NOT synchronized - each has its own position
-
-    uint32_t max_rows = 0;
-    uint32_t max_current_row = 0;
-    uint32_t current_tick = tfmxdec_get_pattern_tick(data->decoder);
-
-    // Calculate row positions for each track
-    // TFMX tracks are asynchronous - each has different row density per tick.
-    uint32_t min_current_row = UINT32_MAX;
-    for (int i = 0; i < num_tracks && i < RV_MAX_CHANNELS; i++) {
-        uint32_t rows = tfmxdec_get_pattern_display_track_rows(data->decoder, i);
-        int current = tfmxdec_find_pattern_display_row_for_tick(data->decoder, i, current_tick);
-        if (current < 0)
-            current = 0;
-
-        info->channels[i].num_rows = rows;
-        info->channels[i].current_row = (uint32_t)current;
-        snprintf(info->channels[i].name, sizeof(info->channels[i].name), "Track %d", i + 1);
-
-        if (rows > max_rows) {
-            max_rows = rows;
-        }
-        if ((uint32_t)current > max_current_row) {
-            max_current_row = (uint32_t)current;
-        }
-        if ((uint32_t)current < min_current_row) {
-            min_current_row = (uint32_t)current;
-        }
-    }
-
-    info->total_rows = max_rows;
-    // Use minimum row for scrolling so no track scrolls off the top
-    info->current_row = (min_current_row != UINT32_MAX) ? min_current_row : 0;
-    info->rows_per_beat = 4; // Typical for TFMX
-    info->rows_per_measure = 16;
-
-    // Build song name from title and artist
-    const char* title = tfmxdec_get_title(data->decoder);
-    const char* name = tfmxdec_get_name(data->decoder);
-    const char* artist = tfmxdec_get_artist(data->decoder);
-
-    // Use title if available, otherwise use name (from filename)
-    const char* display_title = (title != nullptr && title[0] != '\0') ? title : name;
-
-    if (display_title != nullptr && display_title[0] != '\0') {
-        if (artist != nullptr && artist[0] != '\0') {
-            // Format as "Title - Artist"
-            snprintf(info->song_name, sizeof(info->song_name), "%s - %s", display_title, artist);
-        } else {
-            strncpy(info->song_name, display_title, sizeof(info->song_name) - 1);
-        }
-        info->song_name[sizeof(info->song_name) - 1] = '\0';
-    }
-
-    return 0;
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+static void tfmx_note_name(uint8_t note, char* out, size_t out_size) {
+    static const char* names[12] = { "C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-" };
+    snprintf(out, out_size, "%s%d", names[note % 12], note / 12);
+}
 
-static int tfmx_get_pattern_cell(void* user_data, int pattern, int row, int channel, RVPatternCell* cell) {
-    TfmxReplayerData* data = (TfmxReplayerData*)user_data;
-    (void)pattern; // TFMX uses single pattern display, pattern ignored
+// Render the TFMX_COLUMN_COUNT cells (Note, Inst, Vol, Eff, Prm) for one (track, row).
+// Each cell's `raw` is the consistent numeric value and `text` is the rendered string, so
+// TFMX's mixed effect encoding (a letter for WAIT, a raw byte otherwise) is standardized at
+// the boundary: 'W' lives in `text`, the command byte in `raw`. The destination voice
+// (old dest_channel routing) is packed into the Note cell's raw high byte for colouring.
+static void tfmx_fill_row(void* decoder, int track, uint32_t row, RVPatternCell* out) {
+    uint8_t type = 0, note = 0, macro = 0, volume = 0, dest = 0;
+    int8_t detune = 0;
+    uint16_t wait = 0;
+    uint32_t tick = 0;
+    char buf[8];
 
-    if (data == nullptr || data->decoder == nullptr || cell == nullptr) {
-        return -1;
+    if (!tfmxdec_get_pattern_display_row(decoder, track, row, &type, &note, &macro, &volume, &detune, &dest, &wait,
+                                         &tick)) {
+        for (int c = 0; c < TFMX_COLUMN_COUNT; c++) {
+            tfmx_set_cell(&out[c], 0, "");
+        }
+        return;
     }
 
-    uint8_t type, note, macro, volume;
-    int8_t detune;
-    uint8_t dest_channel;
-    uint16_t wait;
-    uint32_t tick;
-
-    if (!tfmxdec_get_pattern_display_row(data->decoder, channel, (uint32_t)row, &type, &note, &macro, &volume, &detune,
-                                         &dest_channel, &wait, &tick)) {
-        return -1;
-    }
+    uint32_t routing = (uint32_t)dest << 8;
 
     if (type == 0) {
-        // Note row: show note, macro, and wait (if embedded) or detune
-        cell->note = note;
-        cell->instrument = macro;
-        cell->volume = volume;
-        if (wait > 0) {
-            // Note has embedded wait - show as W## effect
-            cell->effect = 'W';
-            cell->effect_param = (uint8_t)wait;
-        } else {
-            cell->effect = 0;
-            cell->effect_param = (uint8_t)detune;
-        }
-        cell->dest_channel = dest_channel;
-    } else {
-        // Command row: show command in effect column only
-        cell->note = 0;
-        cell->instrument = 0;
-        cell->volume = 0;
-        if (note == 0xF3) {
-            // WAIT command - display as Wxx for consistency with embedded waits
-            cell->effect = 'W';
-            cell->effect_param = macro;
-        } else {
-            cell->effect = note;
-            cell->effect_param = macro;
-        }
-        cell->dest_channel = dest_channel;
-    }
+        tfmx_note_name(note, buf, sizeof(buf));
+        tfmx_set_cell(&out[0], (uint32_t)note | routing, buf);
 
-    return 0;
+        if (macro != 0) {
+            snprintf(buf, sizeof(buf), "%02X", macro);
+            tfmx_set_cell(&out[1], macro, buf);
+        } else {
+            tfmx_set_cell(&out[1], 0, "..");
+        }
+
+        if (volume != 0) {
+            snprintf(buf, sizeof(buf), "%02X", volume);
+            tfmx_set_cell(&out[2], volume, buf);
+        } else {
+            tfmx_set_cell(&out[2], 0, "..");
+        }
+
+        if (wait != 0) {
+            tfmx_set_cell(&out[3], TFMX_CMD_WAIT, "W");
+            snprintf(buf, sizeof(buf), "%02X", (unsigned)(wait & 0xFF));
+            tfmx_set_cell(&out[4], wait, buf);
+        } else if (detune != 0) {
+            tfmx_set_cell(&out[3], 0, "..");
+            snprintf(buf, sizeof(buf), "%02X", (uint8_t)detune);
+            tfmx_set_cell(&out[4], (uint8_t)detune, buf);
+        } else {
+            tfmx_set_cell(&out[3], 0, "..");
+            tfmx_set_cell(&out[4], 0, "..");
+        }
+    } else {
+        // Command row (TFMX emits WAIT here); `note` holds the command byte, not a pitch.
+        tfmx_set_cell(&out[0], routing, "---");
+        tfmx_set_cell(&out[1], 0, "..");
+        tfmx_set_cell(&out[2], 0, "..");
+        if (note == TFMX_CMD_WAIT) {
+            tfmx_set_cell(&out[3], note, "W");
+        } else {
+            snprintf(buf, sizeof(buf), "%02X", note);
+            tfmx_set_cell(&out[3], note, buf);
+        }
+        snprintf(buf, sizeof(buf), "%02X", macro);
+        tfmx_set_cell(&out[4], macro, buf);
+    }
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static int tfmx_get_pattern_num_rows(void* user_data, int pattern) {
+static bool tfmx_get_structure(void* user_data, RVVizInfo* out) {
     TfmxReplayerData* data = (TfmxReplayerData*)user_data;
-    (void)pattern; // TFMX uses single pattern display
+    if (data == nullptr || data->decoder == nullptr || out == nullptr) {
+        return false;
+    }
+    int num_tracks = tfmxdec_get_pattern_display_num_tracks(data->decoder);
+    if (num_tracks <= 0) {
+        return false;
+    }
+    int num_voices = tfmxdec_voices(data->decoder);
+    out->caps = RVVizCaps_PatternCells | RVVizCaps_Scope;
+    out->scroll_mode = RVScrollMode_PerChannel;
+    out->pattern_channel_count = (uint32_t)num_tracks;
+    out->scope_channel_count = num_voices > 0 ? (uint32_t)num_voices : 0;
+    out->column_count = TFMX_COLUMN_COUNT;
+    return true;
+}
 
+static uint32_t tfmx_get_columns(void* user_data, RVColumnDesc* out, uint32_t cap) {
+    (void)user_data;
+    static const struct {
+        const char* label;
+        uint8_t width;
+        RVColumnKind kind;
+    } cols[TFMX_COLUMN_COUNT] = {
+        { "Note", 3, RVColumnKind_Note }, { "Inst", 2, RVColumnKind_Instrument }, { "Vol", 2, RVColumnKind_Volume },
+        { "Eff", 2, RVColumnKind_Effect }, { "Prm", 2, RVColumnKind_Param },
+    };
+    uint32_t n = cap < TFMX_COLUMN_COUNT ? cap : TFMX_COLUMN_COUNT;
+    for (uint32_t i = 0; i < n; i++) {
+        memset(out[i].label, 0, sizeof(out[i].label));
+        strncpy((char*)out[i].label, cols[i].label, sizeof(out[i].label) - 1);
+        out[i].char_width = cols[i].width;
+        out[i].kind = cols[i].kind;
+    }
+    return n;
+}
+
+static uint32_t tfmx_get_pattern_channels(void* user_data, RVChannelDesc* out, uint32_t cap) {
+    TfmxReplayerData* data = (TfmxReplayerData*)user_data;
     if (data == nullptr || data->decoder == nullptr) {
         return 0;
     }
+    int num_tracks = tfmxdec_get_pattern_display_num_tracks(data->decoder);
+    if (num_tracks < 0) {
+        num_tracks = 0;
+    }
+    uint32_t n = (uint32_t)num_tracks < cap ? (uint32_t)num_tracks : cap;
+    for (uint32_t i = 0; i < n; i++) {
+        memset(out[i].name, 0, sizeof(out[i].name));
+        snprintf((char*)out[i].name, sizeof(out[i].name), "Track %u", i + 1);
+        out[i].scope_width = 0;
+    }
+    return n;
+}
 
-    // Return max rows across all tracks
+static uint32_t tfmx_get_scope_channels(void* user_data, RVChannelDesc* out, uint32_t cap) {
+    TfmxReplayerData* data = (TfmxReplayerData*)user_data;
+    if (data == nullptr || data->decoder == nullptr) {
+        return 0;
+    }
+    int num_voices = tfmxdec_voices(data->decoder);
+    if (num_voices < 0) {
+        num_voices = 0;
+    }
+    uint32_t n = (uint32_t)num_voices < cap ? (uint32_t)num_voices : cap;
+    for (uint32_t i = 0; i < n; i++) {
+        memset(out[i].name, 0, sizeof(out[i].name));
+        snprintf((char*)out[i].name, sizeof(out[i].name), "Voice %u", i + 1);
+        out[i].scope_width = 1; // mono per voice
+    }
+    return n;
+}
+
+static bool tfmx_get_position(void* user_data, RVTrackerPosition* out) {
+    TfmxReplayerData* data = (TfmxReplayerData*)user_data;
+    if (data == nullptr || data->decoder == nullptr || out == nullptr) {
+        return false;
+    }
     int num_tracks = tfmxdec_get_pattern_display_num_tracks(data->decoder);
     uint32_t max_rows = 0;
     for (int i = 0; i < num_tracks; i++) {
@@ -444,39 +470,93 @@ static int tfmx_get_pattern_num_rows(void* user_data, int pattern) {
             max_rows = rows;
         }
     }
-
-    return (int)max_rows;
+    out->order = 0;
+    out->pattern = 0;
+    out->row = 0;
+    out->window_lo = 0;
+    out->window_hi = max_rows; // per-channel playheads come from get_channel_rows
+    return true;
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Scope capture callback
-
-static uint32_t tfmx_get_scope_data(void* user_data, int channel, float* buffer, uint32_t num_samples) {
+static uint32_t tfmx_get_channel_rows(void* user_data, uint32_t* out, uint32_t cap) {
     TfmxReplayerData* data = (TfmxReplayerData*)user_data;
-    if (data == nullptr || data->decoder == nullptr || buffer == nullptr) {
+    if (data == nullptr || data->decoder == nullptr || out == nullptr) {
+        return 0;
+    }
+    int num_tracks = tfmxdec_get_pattern_display_num_tracks(data->decoder);
+    if (num_tracks < 0) {
+        num_tracks = 0;
+    }
+    uint32_t tick = tfmxdec_get_pattern_tick(data->decoder);
+    uint32_t n = (uint32_t)num_tracks < cap ? (uint32_t)num_tracks : cap;
+    for (uint32_t i = 0; i < n; i++) {
+        int r = tfmxdec_find_pattern_display_row_for_tick(data->decoder, (int)i, tick);
+        out[i] = r < 0 ? 0 : (uint32_t)r;
+    }
+    return n;
+}
+
+static uint32_t tfmx_get_cells(void* user_data, int32_t channel, uint32_t row_lo, uint32_t row_hi, RVPatternCell* out,
+                               uint32_t cap) {
+    TfmxReplayerData* data = (TfmxReplayerData*)user_data;
+    if (data == nullptr || data->decoder == nullptr || out == nullptr) {
+        return 0;
+    }
+    int num_tracks = tfmxdec_get_pattern_display_num_tracks(data->decoder);
+    if (num_tracks <= 0) {
         return 0;
     }
 
-    // Auto-enable scope capture on first call
+    int ch_start = channel < 0 ? 0 : channel;
+    int ch_end = channel < 0 ? num_tracks : channel + 1;
+    if (ch_start >= num_tracks) {
+        return 0;
+    }
+    if (ch_end > num_tracks) {
+        ch_end = num_tracks;
+    }
+
+    // Rectangular row-major grid (row -> channel -> column). Rows past a short track's
+    // end yield empty cells so the host can index a fixed stride across channels.
+    uint32_t written = 0;
+    for (uint32_t row = row_lo; row < row_hi; row++) {
+        for (int ch = ch_start; ch < ch_end; ch++) {
+            if (written + TFMX_COLUMN_COUNT > cap) {
+                return written;
+            }
+            tfmx_fill_row(data->decoder, ch, row, &out[written]);
+            written += TFMX_COLUMN_COUNT;
+        }
+    }
+    return written;
+}
+
+static void tfmx_set_scope_enabled(void* user_data, bool on) {
+    TfmxReplayerData* data = (TfmxReplayerData*)user_data;
+    if (data == nullptr || data->decoder == nullptr) {
+        return;
+    }
+    tfmxdec_enable_scope_capture(data->decoder, on ? 1 : 0);
+    data->scope_enabled = on;
+}
+
+static uint32_t tfmx_get_scope_samples(void* user_data, int32_t channel, float* out, uint32_t cap) {
+    TfmxReplayerData* data = (TfmxReplayerData*)user_data;
+    if (data == nullptr || data->decoder == nullptr || out == nullptr) {
+        return 0;
+    }
     if (!data->scope_enabled) {
         tfmxdec_enable_scope_capture(data->decoder, 1);
         data->scope_enabled = true;
     }
-
-    return tfmxdec_get_scope_data(data->decoder, channel, buffer, num_samples);
+    return tfmxdec_get_scope_data(data->decoder, (int)channel, out, cap);
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static uint32_t tfmx_get_scope_channel_names(void* user_data, const char** names, uint32_t max_channels) {
+static uint32_t tfmx_get_vu(void* user_data, float* out, uint32_t cap) {
     (void)user_data;
-    static const char* s_names[] = { "Voice 0", "Voice 1", "Voice 2", "Voice 3" };
-    uint32_t count = 4;
-    if (count > max_channels)
-        count = max_channels;
-    for (uint32_t i = 0; i < count; i++)
-        names[i] = s_names[i];
-    return count;
+    (void)out;
+    (void)cap;
+    return 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -498,14 +578,17 @@ static RVPlaybackPlugin g_tfmx_plugin = {
     tfmx_metadata,
     tfmx_static_init,
     nullptr, // settings_updated
-    // Tracker visualization API
-    tfmx_get_tracker_info,
-    tfmx_get_pattern_cell,
-    tfmx_get_pattern_num_rows,
-    // Scope capture API
-    tfmx_get_scope_data,
     nullptr, // static_destroy
-    tfmx_get_scope_channel_names,
+    tfmx_get_structure,
+    tfmx_get_columns,
+    tfmx_get_pattern_channels,
+    tfmx_get_scope_channels,
+    tfmx_get_position,
+    tfmx_get_channel_rows,
+    tfmx_get_cells,
+    tfmx_set_scope_enabled,
+    tfmx_get_scope_samples,
+    tfmx_get_vu,
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
